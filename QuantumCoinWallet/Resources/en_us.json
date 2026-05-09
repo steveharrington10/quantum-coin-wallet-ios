@@ -221,7 +221,9 @@
       "submitting-transaction": "Please wait while your transaction is being submitted.",
       "transaction-sent": "Your transaction request has been sent.",
       "transaction-id": "Transaction ID",
-      "transaction-message-exits": "A transaction request is already in progress."
+      "transaction-message-exits": "A transaction request is already in progress.",
+      "show-password": "Show password",
+      "hide-password": "Hide password"
     },
     "errors": {
       "selectOption": "Please select an option.",

@@ -113,8 +113,8 @@
 // fails closed (returns a nil hash, which fails the pin
 // comparison). All three of our default endpoints are RSA-2048
 // or ECDSA P-256, so this lookup table is exhaustive for the
-// coverage needs. Adding a new key type (e.g. Ed25519,
-// RSA-4096) is a one-line `kAsn1SpkiPrefixByKeyType` addition.
+// coverage needs. Adding a new key type (e.g. RSA-4096) is a
+// one-line `kAsn1SpkiPrefixByKeyType` addition.
 // - `kTlsPinningEnforced = true` ships pinning live. Two
 // emergency hatches exist: (1) `kPinFailureLogOnly = true`
 // converts a pin miss into a `Logger.debug` line and lets the
