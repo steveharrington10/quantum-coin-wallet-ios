@@ -17,7 +17,12 @@ scripts/
 # Xcode user / build artifacts
 # -----------------------------------------------------------------------------
 build/
+# Xcode derived data (default location + this repo's local override).
+# Both forms listed since macOS HFS+ is case-insensitive but ext4 / CI
+# runners are case-sensitive, and xcodebuild's `-derivedDataPath
+# .derivedData` writes the lowercase form regardless of platform.
 DerivedData/
+.derivedData/
 *.xcuserstate
 xcuserdata/
 *.xcscmblueprint
