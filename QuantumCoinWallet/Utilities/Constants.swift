@@ -23,6 +23,21 @@ public enum Constants {
     public static let MINIMUM_PASSWORD_LENGTH: Int = 12
     public static let UNLOCK_TIMEOUT_MS: Int = 300_000 // 5 minutes
 
+    /// Background-return grace window. The mandatory unlock dialog
+    /// is presented on `applicationDidBecomeActive` only when the
+    /// elapsed time since the last successful unlock exceeds this
+    /// threshold; returning from Safari, the block explorer, or any
+    /// app-switch within the window keeps the session unlocked.
+    ///
+    /// Independent of `UNLOCK_TIMEOUT_MS`: the 5-minute foreground
+    /// idle timer still relocks after `UNLOCK_TIMEOUT_MS` of no user
+    /// interaction while the app stays in the foreground. This
+    /// 3-minute window only governs the snapshot-loaded branch of
+    /// `SessionLock.applicationDidBecomeActive`. Reboot detection
+    /// (`now < lastUnlockMonotonicNanos`) keeps forcing a relock
+    /// regardless of the grace window.
+    public static let FOREGROUND_UNLOCK_GRACE_MS: Int = 180_000 // 3 minutes
+
     // MARK: - Wallet types / seed-length buckets
 
     /// keyType 3 = default (32 seed words).

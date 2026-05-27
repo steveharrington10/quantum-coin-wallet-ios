@@ -1059,6 +1059,61 @@ public final class HomeWalletViewController: UIViewController, HomeScreenViewTyp
         }
     }
 
+    /// Validate the user-typed password without creating a strongbox.
+    ///
+    /// Companion to `bootstrapOrUnlock`, used by `presentUnlockThen`
+    /// where the caller only needs to know the typed password is
+    /// correct before handing it back for the actual persist call —
+    /// `commitGeneratedWallet` / `persistPendingWallet` will then
+    /// drive the strongbox write itself, taking the atomic
+    /// `createNewStrongboxWithInitialWallet` branch on a fresh
+    /// install. Splitting the helpers means the unlock dialog never
+    /// touches disk on a `.noStrongbox` device.
+    ///
+    /// Why it matters:
+    ///   The historical shape called `bootstrapOrUnlock` here, which
+    ///   on `.noStrongbox` writes an empty payload via
+    ///   `createNewStrongbox`. If the user dismissed / backgrounded
+    ///   / crashed between that write and the subsequent
+    ///   `appendWallet`, the strongbox would persist on disk with
+    ///   zero wallets. Cold launch would then see a slot file,
+    ///   route through the mandatory unlock gate, and drop the user
+    ///   into an empty wallet home — the "app created with no
+    ///   wallet" bug. Skipping the create here keeps the
+    ///   bootstrap+first-wallet write in a single AEAD-sealed slot
+    ///   round-trip with `createNewStrongboxWithInitialWallet`, so
+    ///   no empty strongbox can ever exist on disk.
+    ///
+    /// Behavior by bootState:
+    ///   - `.noStrongbox`: no-op. There is nothing on disk to
+    ///     validate against; the caller's next step will atomically
+    ///     create-with-initial-wallet.
+    ///   - `.strongboxPresent` + snapshot loaded: read-only
+    ///     `verifyPassword` (limiter records the attempt, no
+    ///     snapshot reinstall, no counter bump).
+    ///   - `.strongboxPresent` + snapshot not loaded: cold-path
+    ///     `unlockWithPasswordAndApplySession`. This branch is not
+    ///     reachable from `presentUnlockThen` in practice (cold
+    ///     launch with a slot file goes through the mandatory
+    ///     unlock gate before any wizard surface), but is wired so
+    ///     the helper is total over the bootState enum.
+    ///   - `.tampered`: surface the tamper reason verbatim, same as
+    ///     `bootstrapOrUnlock`.
+    nonisolated private static func verifyOnlyIfPresent(password: String) throws {
+        switch UnlockCoordinatorV2.bootState() {
+            case .noStrongbox:
+            return
+            case .strongboxPresent:
+            if Strongbox.shared.isSnapshotLoaded {
+                try UnlockCoordinatorV2.verifyPassword(password)
+            } else {
+                try UnlockCoordinatorV2.unlockWithPasswordAndApplySession(password)
+            }
+            case .tampered(let why):
+            throw UnlockCoordinatorV2Error.tamperDetected(why)
+        }
+    }
+
     /// Wraps `commitGeneratedWallet` with a strongbox unlock prompt for the
     /// "Wallets list > Create or Restore" entry path, where the set-
     /// password step was skipped and `chosenPassword` is empty. On the
@@ -1301,12 +1356,21 @@ public final class HomeWalletViewController: UIViewController, HomeScreenViewTyp
     }
 
     /// Show `UnlockDialogViewController` and validate the typed
-    /// password via `bootstrapOrUnlock`. On success, dismiss the dialog and call
-    /// `then(password)` so the caller can use that exact string for
-    /// `bridge.encryptWalletJson`. On failure, surface the same wrong-
-    /// password UX used by the post-backup unlock prompt
+    /// password via `verifyOnlyIfPresent`. On success, dismiss the
+    /// dialog and call `then(password)` so the caller can use that
+    /// exact string for `bridge.encryptWalletJson`. On failure, surface
+    /// the same wrong-password UX used by the post-backup unlock prompt
     /// (`tapBackupDone`) - inline error + modal alert, password field
     /// is preserved.
+    ///
+    /// Validation deliberately uses `verifyOnlyIfPresent` rather than
+    /// `bootstrapOrUnlock` so the dialog never writes a strongbox on a
+    /// `.noStrongbox` device. The caller (`commitGeneratedWallet` /
+    /// `persistPendingWallet`) is responsible for the atomic
+    /// `createNewStrongboxWithInitialWallet` write that bootstraps the
+    /// strongbox together with the first wallet — see
+    /// `verifyOnlyIfPresent` doc for the empty-strongbox-window
+    /// rationale this split closes.
     private func presentUnlockThen(_ then: @escaping (String) -> Void) {
         let dlg = UnlockDialogViewController()
         dlg.onUnlock = { [weak self, weak dlg] pw in
@@ -1323,7 +1387,7 @@ public final class HomeWalletViewController: UIViewController, HomeScreenViewTyp
                 // UI can distinguish lockout from wrong-password.
                 var failure: Error? = nil
                 do {
-                    try Self.bootstrapOrUnlock(password: pw)
+                    try Self.verifyOnlyIfPresent(password: pw)
                 } catch {
                     failure = error
                 }

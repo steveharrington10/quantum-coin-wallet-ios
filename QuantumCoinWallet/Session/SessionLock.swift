@@ -1,10 +1,19 @@
 // SessionLock.swift
-// Port of the idle-lock logic in `HomeActivity.java`:
-// - `UNLOCK_TIMEOUT_MS = 300_000` (5 min).
-// - Foreground idle timer resets on any UI interaction.
-// - `applicationDidBecomeActive` compares against the last unlock
-// timestamp and locks + presents the unlock dialog if the budget
-// elapsed or the clock went backwards.
+// Port of the idle-lock logic in `HomeActivity.java`, split into two
+// independent timing policies:
+// - Foreground idle relock — `UNLOCK_TIMEOUT_MS = 300_000` (5 min).
+//   Resets on any UI interaction (tap / pan / long-press / text edit)
+//   while the app stays in the foreground.
+// - Background-return grace — `FOREGROUND_UNLOCK_GRACE_MS = 180_000`
+//   (3 min). `applicationDidBecomeActive` compares only the elapsed
+//   time since the last successful unlock against this window and
+//   forces a mandatory relock when the user has been away longer.
+//   `lastBackgroundMonotonicNanos` is still stamped for unrelated
+//   lifecycle observers, but is not part of the relock decision —
+//   short Safari hops / block-explorer round-trips stay unlocked.
+//   Reboot detection (`now < lastUnlockMonotonicNanos` since
+//   `mach_continuous_time()` resets to 0 on boot) keeps forcing a
+//   relock regardless of the grace window.
 // the
 // elapsed-time arithmetic uses `mach_continuous_time()` (continuous
 // nanoseconds since boot, including device-suspended time), NOT
@@ -142,29 +151,48 @@ public final class SessionLock {
         }
 
         let now = Self.monotonicNanos()
-        // Use the more conservative of "elapsed since last unlock" or
-        // "elapsed since the app was backgrounded". In the common case
-        // they match (both move forward at the same rate while the app
-        // is suspended). The `now < lastUnlockMonotonicNanos` guard
-        // catches device REBOOT - `mach_continuous_time()` resets to
-        // 0 on boot, so a stored value larger than `now` is the only
-        // way to read the clock backwards. We force a relock on
-        // reboot so an attacker cannot bypass the gate
-        // by power-cycling a suspended device.
+        // Background-return grace window: compare the elapsed time
+        // since the user's last successful unlock against
+        // `FOREGROUND_UNLOCK_GRACE_MS` (3 min). Returning from any
+        // app switch within that window keeps the session unlocked;
+        // crossing it presents the mandatory unlock dialog.
+        //
+        // `mach_continuous_time()` keeps counting through device
+        // suspend, so `elapsedSinceUnlockMs` already observes the
+        // full real-world elapsed time even when the device was
+        // asleep — no separate "elapsed since background" check is
+        // needed.
+        //
+        // Reboot detection: the `now < lastUnlockMonotonicNanos`
+        // branch fires only after a power cycle (the monotonic
+        // counter resets to 0 on boot, so a stored value larger
+        // than `now` is the only way to read the clock backwards).
+        // Force a relock there so an attacker cannot bypass the
+        // gate by power-cycling a suspended device.
+        //
+        // Both checks are guarded by `lastUnlockMonotonicNanos > 0`.
+        // The sentinel `0` means "never recorded" — which should be
+        // unreachable on the snapshot-loaded branch once every
+        // snapshot-installing path stamps `markUnlockedNow()` (see
+        // `UnlockCoordinatorV2.unlockWithPasswordAndApplySession`,
+        // `createNewStrongbox`, `createNewStrongboxWithInitialWallet`),
+        // but the guard keeps the helper defensive against future
+        // call sites that install a snapshot without stamping.
         let elapsedSinceUnlockMs = Self.elapsedMillis(
             from: lastUnlockMonotonicNanos, to: now)
-        let elapsedSinceBackgroundMs = lastBackgroundMonotonicNanos > 0
-        ? Self.elapsedMillis(from: lastBackgroundMonotonicNanos, to: now)
-        : 0
-        let elapsedMs = max(elapsedSinceUnlockMs, elapsedSinceBackgroundMs)
+        let exceededGrace = lastUnlockMonotonicNanos > 0
+        && elapsedSinceUnlockMs
+            > UInt64(Constants.FOREGROUND_UNLOCK_GRACE_MS)
+        let rebooted = lastUnlockMonotonicNanos > 0
+        && now < lastUnlockMonotonicNanos
 
-        if elapsedMs > UInt64(Constants.UNLOCK_TIMEOUT_MS)
-        || (lastUnlockMonotonicNanos > 0 && now < lastUnlockMonotonicNanos) {
+        if exceededGrace || rebooted {
             lockAndPresent()
         } else {
-            // Within budget - keep the foreground idle countdown
-            // running so the user is re-locked after another
-            // UNLOCK_TIMEOUT_MS of inactivity.
+            // Within grace - keep the foreground idle countdown
+            // running so the user is re-locked after
+            // `UNLOCK_TIMEOUT_MS` of inactivity (independent 5-min
+            // policy from the 3-min background-return window).
             restartIdleTimer()
         }
     }

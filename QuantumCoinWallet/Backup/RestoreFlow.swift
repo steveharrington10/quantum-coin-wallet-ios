@@ -62,6 +62,28 @@ public final class RestoreFlow {
     /// it.
     private var strongboxPassword: String?
 
+    // MARK: - Per-batch summary state
+    //
+    // Per-batch tallies that drive the post-restore summary dialog.
+    // Populated by `runDecryptPass` and `dlg.onCancel`; consumed by
+    // `presentSummaryAndFinish`; reset by `runBatch` on entry and by
+    // `finishBatch` on exit so a follow-up batch starts clean.
+    // Mirrors Android `runBatchedRestorePass` (`restored`,
+    // `alreadyExists`, `skipped` arrays threaded through every pass)
+    // — see `HomeWalletFragment.showRestoreSummaryDialog`.
+    private var restoredAddresses: [String] = []
+    private var alreadyExistsAddresses: [String] = []
+    private var skippedAddresses: [String] = []
+
+    /// Weak handle to the presenter view controller for the current
+    /// batch. Stored so paths that need to present the final summary
+    /// dialog (cancel, all-done, post-decrypt completion) can do so
+    /// without re-threading `host` through every callback chain. The
+    /// presenter is the same VC the caller passed into `runBatch`
+    /// / `restoreFromFile` / `restoreFromCloudFolder`; weak so we do
+    /// not artificially extend its lifetime once the batch is over.
+    private weak var currentHost: UIViewController?
+
     // MARK: - Public entry points
 
     /// Restore from one or more `.wallet` files picked via the system
@@ -93,6 +115,14 @@ public final class RestoreFlow {
     public func runBatch(urls: [URL], host: UIViewController,
         strongboxPassword: String? = nil) {
         didImportAny = false
+        // Reset per-batch summary tallies and stash the host BEFORE we
+        // start dispatching dialogs; every later branch (cancel,
+        // all-done, lockout pre-check) reads from these in addition to
+        // the closure-captured `host` parameter.
+        restoredAddresses.removeAll(keepingCapacity: false)
+        alreadyExistsAddresses.removeAll(keepingCapacity: false)
+        skippedAddresses.removeAll(keepingCapacity: false)
+        currentHost = host
         self.strongboxPassword = (strongboxPassword?.isEmpty == false) ? strongboxPassword : nil
 
         // Build candidates while collecting per-file failure reasons so
@@ -285,7 +315,43 @@ public final class RestoreFlow {
         // way back out of this stack.
         onComplete = nil
         strongboxPassword = nil
+        // Drop per-batch summary state so a follow-up batch (the same
+        // session can run multiple — onboarding-then-add-wallet, or
+        // wallets-screen restore after a previous restore failed)
+        // starts from a clean slate. `currentHost` is also cleared so
+        // any stray late callback that reads it sees nil and no-ops
+        // instead of presenting on a stale presenter.
+        restoredAddresses.removeAll(keepingCapacity: false)
+        alreadyExistsAddresses.removeAll(keepingCapacity: false)
+        skippedAddresses.removeAll(keepingCapacity: false)
+        currentHost = nil
         cb?()
+    }
+
+    /// Build and present the post-restore summary dialog, then route
+    /// through `finishBatch()` once the user dismisses it. Mirrors
+    /// Android `HomeWalletFragment.showRestoreSummaryDialog`. If the
+    /// host has been torn down (weak ref nil'd) we skip the dialog
+    /// and finish immediately — there is no presenter we can safely
+    /// attach to, and the alternative is leaking the batch state.
+    /// Not marked `@MainActor` because every call site is already on
+    /// the main thread (the dialog dismissal completion handlers and
+    /// `dlg.onCancel` all fire on main), and forcing the annotation
+    /// would require sprinkling `Task { @MainActor in ... }`
+    /// wrappers at non-isolated callers like the password-dialog
+    /// cancel closure for no real safety gain — `present(_:)` would
+    /// trap immediately on a non-main caller anyway.
+    private func presentSummaryAndFinish() {
+        guard let host = currentHost else {
+            finishBatch()
+            return
+        }
+        let dlg = RestoreSummaryDialogViewController(
+            restored: restoredAddresses,
+            alreadyExists: alreadyExistsAddresses,
+            skipped: skippedAddresses)
+        dlg.onClose = { [weak self] in self?.finishBatch() }
+        host.present(dlg, animated: true)
     }
 
     private func presentBatchDialog(pending: [Candidate], host: UIViewController) {
@@ -299,7 +365,18 @@ public final class RestoreFlow {
                 host: host, dialog: dlg)
         }
         dlg.onCancel = { [weak self] in
-            self?.finishBatch()
+            // Mark every wallet still waiting on a password as Skipped
+            // so the post-restore summary attributes them correctly
+            // (matches Android `runBatchedRestorePass` lines 2864-2870
+            // where the cancel branch loops pending → skipped). The
+            // password dialog has already dismissed itself by the time
+            // this fires, so the summary presents directly on the
+            // host VC.
+            guard let self = self else { return }
+            for c in pending {
+                self.skippedAddresses.append(c.address)
+            }
+            self.presentSummaryAndFinish()
         }
         host.present(dlg, animated: true)
     }
@@ -307,6 +384,27 @@ public final class RestoreFlow {
     private func runDecryptPass(pending: [Candidate], password: String,
         host: UIViewController, dialog: BackupPasswordDialog) {
         let L = Localization.shared
+        // Limiter pre-check is now done ONCE per password submission
+        // (not once per wallet inside the loop). A locked-out caller
+        // never reaches the wait dialog or scrypt loop — instead we
+        // show the canonical lockout copy on the password dialog and
+        // let the user wait it out without burning ~300 ms of scrypt
+        // per wallet only to be rejected at the end. Matches Android
+        // `runBatchedRestorePass` policy: one limiter event per OK
+        // tap, regardless of how many `.wallet` files are in the
+        // batch. See `UnlockAttemptLimiter` header for the shared-
+        // counter rationale.
+        switch UnlockAttemptLimiter.currentDecision() {
+            case .lockedFor(let remaining):
+            let msg = UnlockAttemptLimiter
+                .userFacingLockoutMessage(remainingSeconds: remaining)
+            showRestoreError(over: dialog, message: msg) {
+                dialog.reEnable(withError: nil)
+            }
+            return
+            case .allowed:
+            break
+        }
         let wait = WaitDialogViewController(
             message: L.getRestoreWalletsDecryptingByLangValues())
         let progressTemplate = L.getRestoreProgressOfByLangValues()
@@ -325,6 +423,7 @@ public final class RestoreFlow {
             Task.detached(priority: .userInitiated) {
                 var stillPending: [Candidate] = []
                 var alreadyExisting: [Candidate] = []
+                var importedThisPass: [Candidate] = []
                 let total = pending.count
                 for (i, c) in pending.enumerated() {
                     await MainActor.run {
@@ -336,6 +435,7 @@ public final class RestoreFlow {
                     switch self.tryDecryptAndStore(candidate: c, password: password,
                         onPhase: onPhase) {
                         case .imported:
+                        importedThisPass.append(c)
                         await MainActor.run { self.didImportAny = true }
                         case .alreadyExists:
                         alreadyExisting.append(c)
@@ -343,7 +443,34 @@ public final class RestoreFlow {
                         stillPending.append(c)
                     }
                 }
+                // Record exactly one limiter event per password
+                // submission. Any success at all (a single wallet
+                // decrypted with this password) is treated as a
+                // confirmed-correct password and zeros the counter;
+                // only an all-failure pass (no imports, no dupes
+                // because dupes would have come from a previously
+                // confirmed-correct password too) increments it.
+                // The pure-duplicates case (all entries already in
+                // the strongbox, nothing newly imported and nothing
+                // failed) does NOT count toward the limiter in
+                // either direction — the password was never
+                // actually exercised against ciphertext.
+                if !importedThisPass.isEmpty {
+                    UnlockAttemptLimiter.recordSuccess(channel: .backupDecrypt)
+                } else if !stillPending.isEmpty {
+                    UnlockAttemptLimiter.recordFailure(channel: .backupDecrypt)
+                }
                 await MainActor.run {
+                    // Promote the per-pass tallies into the per-batch
+                    // summary state before handing off to the dialog
+                    // glue, so the cancel / all-done / partial-progress
+                    // branches all see the same authoritative arrays.
+                    for c in importedThisPass {
+                        self.restoredAddresses.append(c.address)
+                    }
+                    for c in alreadyExisting {
+                        self.alreadyExistsAddresses.append(c.address)
+                    }
                     self.handlePassResult(pending: pending,
                         stillPending: stillPending,
                         alreadyExisting: alreadyExisting,
@@ -379,22 +506,17 @@ public final class RestoreFlow {
         Strongbox.shared.index(forAddress: candidate.address) != nil {
             return .alreadyExists
         }
-        // (notes): backup-restore is the
-        // second of two brute-force channels (the first is the
-        // strongbox unlock dialog, gated inside
-        // `UnlockCoordinatorV2.unlockWithPasswordAndApplySession`).
-        // The limiter is shared across both channels so an attacker
-        // who alternates "try a strongbox unlock, then try a backup
-        // decrypt, then try a strongbox unlock" does not get N extra
-        // attempts by switching surfaces. Pre-check before paying
-        // scrypt cost in the JS bridge so a locked-out caller fails
-        // fast without burning ~300 ms per try.
-        switch UnlockAttemptLimiter.currentDecision() {
-            case .lockedFor:
-            return .failed
-            case .allowed:
-            break
-        }
+        // Limiter accounting (pre-check + record on success/failure)
+        // is performed once per password submission in
+        // `runDecryptPass`, NOT once per wallet here. Counting per
+        // wallet poisoned the shared limiter on the FIRST wrong-
+        // password tap against any batch of ≥5 `.wallet` files,
+        // which bled into the strongbox unlock dialog (same shared
+        // counter) and produced the bogus "too many failed
+        // attempts" symptom on first-time setup and on the 2nd
+        // password prompt of a multi-pass restore. See the file
+        // header comments on `UnlockAttemptLimiter` for the
+        // shared-counter rationale.
 
         do {
             // Decrypt the cloud `.wallet` blob with the backup
@@ -565,25 +687,20 @@ public final class RestoreFlow {
                 Logger.warn(category: "PREFS_FLUSH_FAIL",
                     "WALLET_CURRENT_ADDRESS_INDEX_KEY: \(error)")
             }
-            // Shared brute-force counter is reset
-            // on a confirmed-correct backup password (we got far
-            // enough to derive a wallet from the recovered seed).
-            // The strongbox unlock that ran during this flow ALSO
-            // resets the counter via
-            // `unlockWithPasswordAndApplySession` - the explicit
-            // reset here is for the strongbox-already-unlocked
-            // branch ("add another wallet" post-onboarding) where
-            // this is the only confirmation point.
-            UnlockAttemptLimiter.recordSuccess(channel: .backupDecrypt)
+            // Limiter accounting is done once per password
+            // submission in `runDecryptPass` (see the note at the
+            // top of this method). We deliberately do NOT call
+            // recordSuccess here, since one OK tap that decrypts
+            // 5 wallets must count as a single success against
+            // the shared brute-force counter — not 5.
             return .imported
         } catch {
-            // Backup-decrypt failure (wrong
-            // password, mismatched recovered address, corrupt
-            // ciphertext) increments the shared limiter. The same
-            // increment in `unlockWithPasswordAndApplySession`
-            // covers strongbox-unlock failures on the same
-            // channel.
-            UnlockAttemptLimiter.recordFailure(channel: .backupDecrypt)
+            // Limiter accounting is done once per password
+            // submission in `runDecryptPass` (see the note at the
+            // top of this method). Returning `.failed` lets the
+            // caller tally up all-passed / all-failed / partial
+            // for this pass and record exactly one limiter event
+            // accordingly.
             return .failed
         }
     }
@@ -646,11 +763,14 @@ public final class RestoreFlow {
         wait.dismiss(animated: true) {
             if stillPending.isEmpty {
                 // Every wallet was processed (imported or skipped as
-                // duplicate). Close the dialog, surface the duplicate
-                // toast if applicable, and notify the caller.
+                // duplicate). Close the dialog, then present the
+                // summary card before finishing the batch. The
+                // summary doubles as the duplicate notice that the
+                // older toast-only flow surfaced, so the toast is no
+                // longer needed on this branch — the summary lists
+                // duplicates under the "Already exists" status.
                 dialog.dismiss(animated: true) {
-                    self.surfaceDuplicates(alreadyExisting)
-                    self.finishBatch()
+                    self.presentSummaryAndFinish()
                 }
             } else if stillPending.count + alreadyExisting.count == pending.count
             && stillPending.count == pending.count {

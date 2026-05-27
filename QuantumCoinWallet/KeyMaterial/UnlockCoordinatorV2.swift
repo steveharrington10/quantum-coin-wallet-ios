@@ -911,6 +911,19 @@ public enum UnlockCoordinatorV2 {
         // Step 5: install the empty snapshot so the UI sees a
         // freshly-unlocked wallet.
         Strongbox.shared.installSnapshot(payload)
+
+        // Stamp the SessionLock "last unlocked at" clock so
+        // `applicationDidBecomeActive` does not treat a mid-
+        // onboarding background return as a >grace-window elapsed
+        // event (the sentinel `0` would compute an effectively
+        // infinite elapsed and force-relock on every foreground
+        // resume between create and first wallet append).
+        // Dispatched on the main queue to match the convention used
+        // by `unlockWithPasswordAndApplySession` and because
+        // SessionLock's internal mutations expect the main thread.
+        DispatchQueue.main.async {
+            SessionLock.shared.markUnlockedNow()
+        }
     }
 
     // MARK: - First-time strongbox creation with initial wallet
@@ -1092,6 +1105,17 @@ public enum UnlockCoordinatorV2 {
         }
 
         Strongbox.shared.installSnapshot(payload)
+
+        // Stamp the SessionLock "last unlocked at" clock for the
+        // same reason as `createNewStrongbox` — the atomic
+        // bootstrap+wallet path lands the user on the post-create
+        // wizard with a loaded snapshot, and without this stamp the
+        // sentinel `0` would make every subsequent
+        // `applicationDidBecomeActive` compute an effectively
+        // infinite elapsed window and force-relock the user.
+        DispatchQueue.main.async {
+            SessionLock.shared.markUnlockedNow()
+        }
     }
 
     // MARK: - Persist (any post-unlock mutation)
