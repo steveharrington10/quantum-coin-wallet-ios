@@ -31,9 +31,9 @@
 // - The user's "advanced signing" toggle, read pre-unlock by
 // transaction-review screens that need to render fee
 // defaults before any network call.
-// - The user's chosen iCloud Drive folder URI for `.wallet`
+// - The user's chosen backup folder URI for `.wallet`
 // exports (bookmark resolution must run before the user
-// unlocks because the import / restore-from-cloud flows
+// unlocks because the import / restore-from-folder flows
 // happen pre-unlock on a fresh install).
 // - The "camera permission asked once" flag, used to gate
 // the system permission prompt that runs from the QR
