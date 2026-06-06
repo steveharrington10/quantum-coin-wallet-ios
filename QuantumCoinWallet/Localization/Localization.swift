@@ -184,7 +184,7 @@ public final class Localization {
     public func getBackupFailedByLangValues() -> String { langString("backup-failed") }
     public func getBackupPasswordByLangValues() -> String { langString("backup-password") }
     public func getConfirmBackupPasswordByLangValues() -> String { langString("confirm-backup-password") }
-    public func getRestoreFromCloudByLangValues() -> String { langString("restore-from-cloud") }
+    public func getRestoreFromFolderByLangValues() -> String { langString("restore-from-folder") }
     public func getRestoreFromFileByLangValues() -> String { langString("restore-from-file") }
     public func getRestoreDecryptFailedByLangValues() -> String { langString("restore-decrypt-failed") }
     public func getRestoreEnterDifferentPasswordByLangValues() -> String { langString("restore-enter-different-password") }
@@ -209,7 +209,6 @@ public final class Localization {
         langString("restore-wallets-decrypting")
     }
     public func getCameraPermissionDeniedByLangValues() -> String { langString("camera-permission-denied") }
-    public func getBackupToCloudByLangValues() -> String { langString("backup-to-cloud") }
     public func getCloudBackupInfoByLangValues() -> String { langString("cloud-backup-info") }
     public func getBackupToFileByLangValues() -> String { langString("backup-to-file") }
     public func getBackupDoneByLangValues() -> String { langString("backup-done") }

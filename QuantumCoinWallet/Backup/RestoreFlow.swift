@@ -1,5 +1,5 @@
 // RestoreFlow.swift
-// Coordinates restore-from-file and restore-from-cloud-folder flows.
+// Coordinates restore-from-file and restore-from-folder flows.
 // Mirrors the Android `WalletsFragment.runBatchedRestorePass` loop:
 // * Load every candidate file up front (URL + JSON + address).
 // * Show one BackupPasswordDialog listing all pending addresses.
@@ -80,7 +80,7 @@ public final class RestoreFlow {
     /// dialog (cancel, all-done, post-decrypt completion) can do so
     /// without re-threading `host` through every callback chain. The
     /// presenter is the same VC the caller passed into `runBatch`
-    /// / `restoreFromFile` / `restoreFromCloudFolder`; weak so we do
+    /// / `restoreFromFile` / `restoreFromFolder`; weak so we do
     /// not artificially extend its lifetime once the batch is over.
     private weak var currentHost: UIViewController?
 
@@ -96,9 +96,9 @@ public final class RestoreFlow {
         }
     }
 
-    /// Enumerate the persisted cloud folder, feed every `.wallet` file
+    /// Enumerate the persisted backup folder, feed every `.wallet` file
     /// through the batch-restore flow.
-    public func restoreFromCloudFolder(from host: UIViewController,
+    public func restoreFromFolder(from host: UIViewController,
         strongboxPassword: String? = nil) {
         let files = CloudBackupManager.shared.listWalletFiles
         if files().isEmpty {
@@ -109,8 +109,8 @@ public final class RestoreFlow {
     }
 
     /// Run the batched restore pass over a pre-resolved set of URLs.
-    /// Used by `restoreFromFile`, `restoreFromCloudFolder`, and the
-    /// `HomeWalletViewController.startCloudRestore` entry that
+    /// Used by `restoreFromFile`, `restoreFromFolder`, and the
+    /// `HomeWalletViewController.startFolderRestore` entry that
     /// re-presents the folder picker every time.
     public func runBatch(urls: [URL], host: UIViewController,
         strongboxPassword: String? = nil) {
@@ -498,7 +498,7 @@ public final class RestoreFlow {
         // Skip already-imported wallets up front so we don't waste a
         // scrypt cycle and don't pollute the keystore with duplicate
         // slots. Mirrors Android `walletAlreadyExists` short-circuit.
-        // The strongbox may not be unlocked yet (onboarding cloud-restore
+        // The strongbox may not be unlocked yet (onboarding folder-restore
         // path) - in that case the address-to-index map is empty and
         // we let the dedupe check fall through; the duplicate is then
         // caught after the strongbox unlock rebuilds the map below.
@@ -519,7 +519,7 @@ public final class RestoreFlow {
         // shared-counter rationale.
 
         do {
-            // Decrypt the cloud `.wallet` blob with the backup
+            // Decrypt the `.wallet` blob with the backup
             // password to (a) verify the password is correct and
             // (b) recover the raw signing-key bytes + seed phrase
             // so we can persist them directly into the strongbox.
@@ -603,7 +603,7 @@ public final class RestoreFlow {
             let hasSeed = !seedJoined.isEmpty
             // The strongbox password used for strongbox writes is
             // either:
-            // - Onboarding (fresh install) cloud-restore path: the
+            // - Onboarding (fresh install) folder-restore path: the
             // user's chosen strongbox password from Set Wallet
             // Password (passed in via `strongboxPassword`).
             // Falling back to the backup password would silently
@@ -790,9 +790,36 @@ public final class RestoreFlow {
                 // surface duplicates, then re-open the dialog with the
                 // shrunken pending list (Android opens a fresh dialog
                 // each pass too).
+                // `pending = imported + alreadyExisting + stillPending`,
+                // so the number restored in THIS pass is the remainder.
+                let importedThisPassCount =
+                    pending.count - stillPending.count - alreadyExisting.count
                 dialog.dismiss(animated: true) {
                     self.surfaceDuplicates(alreadyExisting)
-                    self.presentBatchDialog(pending: stillPending, host: host)
+                    let reopen = { [weak self] in
+                        guard let self = self else { return }
+                        self.presentBatchDialog(pending: stillPending, host: host)
+                    }
+                    if importedThisPassCount > 0 {
+                        // Mirror Android `runBatchedRestorePass`:
+                        // acknowledge how many wallets were restored this
+                        // pass (count only), then reopen the password
+                        // dialog whose `.restoreBatch` list shows the
+                        // remaining addresses. Only shown when at least
+                        // one wallet decrypted this pass (progress from
+                        // pure duplicates reopens silently).
+                        let template = Localization.shared
+                            .getRestorePartialProgressByLangValues()
+                        let msg = template.replacingOccurrences(
+                            of: "[COUNT]", with: "\(importedThisPassCount)")
+                        self.showRestoreInfo(
+                            over: host,
+                            title: Localization.shared.getBackupByLangValues(),
+                            message: msg,
+                            onOK: reopen)
+                    } else {
+                        reopen()
+                    }
                 }
             }
         }
@@ -814,6 +841,24 @@ public final class RestoreFlow {
         onOK: @escaping () -> Void) {
         let dlg = ConfirmDialogViewController(
             title: Localization.shared.getErrorTitleByLangValues(),
+            message: message,
+            confirmText: Localization.shared.getOkByLangValues(),
+            cancelText: "",
+            hideCancel: true)
+        dlg.onConfirm = onOK
+        presenter.present(dlg, animated: true)
+    }
+
+    /// Single-OK informational modal with a caller-supplied title.
+    /// Used for the partial-progress acknowledgment between batch
+    /// passes (title "Backup"); structurally identical to
+    /// `showRestoreError` but not pinned to the "Error" title.
+    private func showRestoreInfo(over presenter: UIViewController,
+        title: String,
+        message: String,
+        onOK: @escaping () -> Void) {
+        let dlg = ConfirmDialogViewController(
+            title: title,
             message: message,
             confirmText: Localization.shared.getOkByLangValues(),
             cancelText: "",

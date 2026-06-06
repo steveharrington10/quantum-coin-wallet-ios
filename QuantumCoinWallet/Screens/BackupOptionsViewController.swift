@@ -2,18 +2,17 @@
 // Full-screen Backup Options surface launched from the Wallets list
 // when the user taps the blue Backup tile next to a row. Mirrors the
 // chrome of `HomeWalletViewController.renderBackupOptions` (back bar +
-// title + description + rule + Cloud + File + rule + Done) so the
-// flow visually matches the first-time onboarding "backup options"
-// screen rather than appearing as a modal action sheet.
+// title + description + rule + File) so the flow visually matches the
+// first-time onboarding "backup options" screen rather than appearing
+// as a modal action sheet.
 // Mechanics match the first-time pipeline through `BackupExporter`:
-// 1. (Cloud only) show the cloud-backup info dialog.
-// 2. `UnlockDialogViewController` -> validate the strongbox password.
-// 3. `Strongbox.seedWords(at:)` (raw seed phrase straight from
+// 1. `UnlockDialogViewController` -> validate the strongbox password.
+// 2. `Strongbox.seedWords(at:)` (raw seed phrase straight from
 //    the unlocked snapshot — no per-wallet envelope to unwrap)
 // to recover the seed phrase for the chosen wallet.
-// 4. `BackupPasswordDialog` -> collect a fresh backup password.
-// 5. `BackupExporter.reencryptAndExport` -> re-encrypt under the new
-// password and hand off to `CloudBackupManager` for cloud / file.
+// 3. `BackupPasswordDialog` -> collect a fresh backup password.
+// 4. `BackupExporter.reencryptAndExport` -> re-encrypt under the new
+// password and hand off to the share sheet for the file export.
 // Android references:
 // WalletsFragment.onWalletExportClick (unlock first, then choose)
 // HomeWalletFragment.showBackupOptionsScreen (UI parity)
@@ -64,8 +63,8 @@ HomeScreenViewTypeProviding {
 
         renderBackupOptions()
 
-        // Apply alpha-dim press feedback to back arrow + the three
-        // primary action buttons (Cloud / File / Done).
+        // Apply alpha-dim press feedback to back arrow + the
+        // primary action button (File).
         view.installPressFeedbackRecursive()
     }
 
@@ -75,46 +74,32 @@ HomeScreenViewTypeProviding {
         let title = makeTitle(L.getBackupOptionsTitleByLangValues())
         let body = makeBody(L.getBackupOptionsDescriptionByLangValues())
 
-        let cloud = makePrimaryButton(L.getBackupToCloudByLangValues())
-        cloud.addTarget(self, action: #selector(tapBackupCloud), for: .touchUpInside)
         let file = makePrimaryButton(L.getBackupToFileByLangValues())
         file.addTarget(self, action: #selector(tapBackupFile), for: .touchUpInside)
 
         // No trailing "Next" / "Done" pill on this surface. The user
         // reached this screen from the already-unlocked Wallets list,
-        // so the only meaningful actions are Cloud / File (each of
-        // which has its own UnlockDialog + completion hand-off) or
-        // the back arrow. The post-create wallet onboarding flow
+        // so the only meaningful actions are File (which has its own
+        // UnlockDialog + completion hand-off) or the back arrow. The
+        // post-create wallet onboarding flow
         // (`HomeWalletViewController.renderBackupOptions`) keeps its
         // Next pill because that surface still has a "continue to
         // home" step after backup.
-        [backBar, title, body, makeRule(), cloud, file]
+        [backBar, title, body, makeRule(), file]
         .forEach { contentStack.addArrangedSubview($0) }
     }
 
     // MARK: - Actions
 
-    @objc private func tapBackupCloud() {
-        let info = ConfirmDialogViewController(
-            title: "",
-            message: Localization.shared.getCloudBackupInfoByLangValues(),
-            confirmText: Localization.shared.getOkByLangValues(),
-            hideCancel: true)
-        info.onConfirm = { [weak self] in
-            self?.runBackupFlow(target: .cloud)
-        }
-        present(info, animated: true)
-    }
-
     @objc private func tapBackupFile() {
-        runBackupFlow(target: .file)
+        runBackupFlow()
     }
 
     @objc private func tapBackBar() {
         (parent as? HomeViewController)?.showWallets()
     }
 
-    // MARK: - Cloud / File pipeline
+    // MARK: - File pipeline
 
     /// Step 1 of the export pipeline: present `UnlockDialogViewController`
     /// to validate the strongbox password. On success, decrypt the slot's
@@ -126,7 +111,7 @@ HomeScreenViewTypeProviding {
     /// `HomeWalletViewController.presentUnlockThen`. Wrong strongbox
     /// password leaves the unlock dialog up with the same inline error
     /// + cleared field UX used by `WalletsViewController.revealWallet`.
-    private func runBackupFlow(target: BackupTarget) {
+    private func runBackupFlow() {
         let dlg = UnlockDialogViewController()
         dlg.onUnlock = { [weak self, weak dlg] strongboxPassword in
             guard let self = self, let dlg = dlg else { return }
@@ -198,7 +183,6 @@ HomeScreenViewTypeProviding {
                             case .success(let payload):
                             dlg?.dismiss(animated: true) {
                                 self?.promptBackupPasswordAndExport(
-                                    target: target,
                                     payload: payload.payload,
                                     address: payload.address)
                             }
@@ -230,12 +214,10 @@ HomeScreenViewTypeProviding {
 
     /// Step 2 of the export pipeline: collect the user's chosen backup
     /// password, then delegate to `BackupExporter` for the re-encrypt
-    /// + cloud-folder / share-sheet hand-off. `payload` carries either
-    /// the seed phrase (`.seedWords`) or the raw signing-key bytes
-    /// (`.keys`) - the exporter picks the matching `bridge.html`
-    /// branch.
-    private func promptBackupPasswordAndExport(target: BackupTarget,
-        payload: BackupExportPayload,
+    /// + share-sheet hand-off. `payload` carries either the seed phrase
+    /// (`.seedWords`) or the raw signing-key bytes (`.keys`) - the
+    /// exporter picks the matching `bridge.html` branch.
+    private func promptBackupPasswordAndExport(payload: BackupExportPayload,
         address: String) {
         // Pass `address` so the dialog's hidden `.username` field
         // can scope the iOS Keychain Save prompt to a per-wallet
@@ -251,7 +233,6 @@ HomeScreenViewTypeProviding {
                     payload: payload,
                     address: address,
                     backupPassword: backupPwd,
-                    target: target,
                     presenter: self)
             }
         }
@@ -315,9 +296,9 @@ HomeScreenViewTypeProviding {
         b.backgroundColor = UIColor(named: "colorPrimary") ?? .systemBlue
         // `colorCommon7` is white in light mode and black in dark mode.
         // Matches the convention already used by `GreenPillButton` /
-        // `GrayPillButton` so the `Backup to Cloud` and `Backup to File`
-        // titles flip to black in dark mode instead of staying
-        // hard-coded white against the purple pill.
+        // `GrayPillButton` so the `Backup to File` title flips to black
+        // in dark mode instead of staying hard-coded white against the
+        // purple pill.
         b.setTitleColor(UIColor(named: "colorCommon7") ?? .white, for: .normal)
         b.layer.cornerRadius = 10
         b.heightAnchor.constraint(equalToConstant: 44).isActive = true

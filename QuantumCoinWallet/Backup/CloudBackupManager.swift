@@ -308,16 +308,25 @@ public final class CloudBackupManager: NSObject {
         // directory is not exposed to iTunes / Finder / Files.
         // The picker can still navigate to / from it; an external
         // observer (USB sync, file-provider sandbox) cannot.
+        // Prefer the last-used backup folder (persisted security-scoped
+        // bookmark) so the restore picker reopens where the user last
+        // saved/restored, matching Android's `EXTRA_INITIAL_URI` seeded
+        // from the shared `CLOUD_BACKUP_FOLDER_URI` pref. Fall back to
+        // iCloud Drive / Documents when no bookmark resolves.
         let fm = FileManager.default
-        let iCloud = URL(
-            fileURLWithPath: "/var/mobile/Library/Mobile Documents/com~apple~CloudDocs",
-            isDirectory: true)
-        if fm.fileExists(atPath: iCloud.path) {
-            picker.directoryURL = iCloud
-        } else if let docs = try? fm.url(
-            for: .documentDirectory, in: .userDomainMask,
-            appropriateFor: nil, create: false) {
-            picker.directoryURL = docs
+        if let remembered = resolveBookmark() {
+            picker.directoryURL = remembered
+        } else {
+            let iCloud = URL(
+                fileURLWithPath: "/var/mobile/Library/Mobile Documents/com~apple~CloudDocs",
+                isDirectory: true)
+            if fm.fileExists(atPath: iCloud.path) {
+                picker.directoryURL = iCloud
+            } else if let docs = try? fm.url(
+                for: .documentDirectory, in: .userDomainMask,
+                appropriateFor: nil, create: false) {
+                picker.directoryURL = docs
+            }
         }
         picker.delegate = self
         presentPicker(picker, from: vc)

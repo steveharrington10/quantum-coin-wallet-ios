@@ -45,6 +45,17 @@ public final class JsBridge: @unchecked Sendable {
 
     private static let defaultTimeoutSeconds: TimeInterval = 30
 
+    /// Result-wait timeout for the signing calls
+    /// (`sendTransaction` / `sendTokenTransaction`). These run the
+    /// CPU-heavy post-quantum signing path inside the JS bundle,
+    /// which on real device hardware can take far longer than the
+    /// 30s `defaultTimeoutSeconds` budget (the simulator runs on
+    /// the host CPU and finishes well under it). Only the result
+    /// (settle) wait uses this value; the bridge-readiness wait
+    /// still uses `defaultTimeoutSeconds` since readiness is
+    /// unrelated to how long a signature takes.
+    private static let signingTimeoutSeconds: TimeInterval = 120
+
     private init() {}
 
     // MARK: - Push helpers
@@ -168,7 +179,7 @@ public final class JsBridge: @unchecked Sendable {
         // launch. See `Security/TamperGatePolicy.swift` for the
         // full policy and tradeoff write-up.
         try TamperGatePolicy.shared.assertSafeToSign()
-        return try blockingCall { cb, rid in
+        return try blockingCall(settleTimeout: Self.signingTimeoutSeconds) { cb, rid in
             // Stage the secret bytes on the binary channel
             // (NOT in the JSON payload). The JSON envelope carries
             // only the non-secret signing context.
@@ -202,7 +213,7 @@ public final class JsBridge: @unchecked Sendable {
         // ERC-20-style token path because the same private key
         // signs both transaction kinds.
         try TamperGatePolicy.shared.assertSafeToSign()
-        return try blockingCall { cb, rid in
+        return try blockingCall(settleTimeout: Self.signingTimeoutSeconds) { cb, rid in
             try JsEngine.shared.storePendingPayloadBinary(
                 requestId: rid, key: "privKey", data: privKey)
             try JsEngine.shared.storePendingPayloadBinary(
@@ -486,9 +497,11 @@ public final class JsBridge: @unchecked Sendable {
 
     // MARK: - Internals
 
-    private func blockingCall(_ body: (BridgeCallback, String) throws -> Void) throws -> String {
+    private func blockingCall(settleTimeout: TimeInterval = defaultTimeoutSeconds,
+        _ body: (BridgeCallback, String) throws -> Void) throws -> String {
         let requestId = UUID().uuidString.lowercased()
-        return try blockingCallWithExplicitRid(requestId: requestId) { cb in
+        return try blockingCallWithExplicitRid(requestId: requestId,
+            settleTimeout: settleTimeout) { cb in
             try body(cb, requestId)
         }
     }
@@ -497,7 +510,10 @@ public final class JsBridge: @unchecked Sendable {
     /// `requestId`. Used by the wallet-envelope helpers so
     /// the Swift facade can reserve the inbound binary slots under
     /// the same rid the JS handler will stage them under.
+    /// `settleTimeout` controls only the result wait; the bridge-
+    /// readiness wait always uses `defaultTimeoutSeconds`.
     private func blockingCallWithExplicitRid(requestId: String,
+        settleTimeout: TimeInterval = defaultTimeoutSeconds,
         body: (BridgeCallback) throws -> Void) throws -> String {
         precondition(!Thread.isMainThread,
             "Blocking bridge call must not be invoked on the main thread")
@@ -513,7 +529,7 @@ public final class JsBridge: @unchecked Sendable {
             JsEngine.shared.removePendingPayload(requestId: requestId)
             throw error
         }
-        guard let outcome = settle.waitUntilSettled(timeout: Self.defaultTimeoutSeconds) else {
+        guard let outcome = settle.waitUntilSettled(timeout: settleTimeout) else {
             JsEngine.shared.removePendingPayload(requestId: requestId)
             throw JsEngineError.timeout
         }

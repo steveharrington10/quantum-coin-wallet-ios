@@ -56,11 +56,11 @@ public final class RestoreSummaryDialogViewController: ModalDialogViewController
         super.viewDidLoad()
         let L = Localization.shared
 
-        // Title: reuse the existing `restore-from-cloud` key
-        // ("Restore from Cloud") to match Android — there is no
+        // Title: reuse the existing `restore-from-folder` key
+        // ("Restore from folder") to match Android — there is no
         // dedicated `restore-summary-title` key on either platform
         // and adding one would diverge the two clients' copy.
-        titleLabel.text = L.getRestoreFromCloudByLangValues()
+        titleLabel.text = L.getRestoreFromFolderByLangValues()
         titleLabel.font = Typography.boldTitle(17)
         titleLabel.textAlignment = .center
 

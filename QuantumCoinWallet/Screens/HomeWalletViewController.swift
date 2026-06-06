@@ -10,8 +10,7 @@
 // - Wallet type: Default -> keyType 3 / 32 words; Advanced -> 5 / 36.
 // - Seed word length: 32 / 36 / 48 (phrase-restore only).
 // - Seed verify uses BIP39Words + JsBridge.doesSeedWordExist.
-// - Backup options: Cloud button shows cloud-backup-info confirmation
-// before the folder picker, File button uses export-temp.
+// - Backup options: File button uses export-temp.
 // Android reference:
 // app/src/main/java/com/quantumcoinwallet/app/view/fragment/HomeWalletFragment.java
 // app/src/main/res/layout/home_wallet_fragment.xml
@@ -300,11 +299,11 @@ public final class HomeWalletViewController: UIViewController, HomeScreenViewTyp
         let group = RadioGroup()
         // Tag scheme matches Android `home_wallet_fragment.xml`:
         // 1 = Create new, 0 = Restore from seed,
-        // 2 = Restore from File, 3 = Restore from Cloud.
+        // 2 = Restore from File, 3 = Restore from folder.
         group.addChoice(tag: 1, title: L.getCreateNewWalletByLangValues())
         group.addChoice(tag: 0, title: L.getRestoreWalletFromSeedByLangValues())
         group.addChoice(tag: 2, title: L.getRestoreFromFileByLangValues())
-        group.addChoice(tag: 3, title: L.getRestoreFromCloudByLangValues())
+        group.addChoice(tag: 3, title: L.getRestoreFromFolderByLangValues())
         // Match Android `HomeWalletFragment.java:457-461` which leaves
         // both radios unchecked until the user picks one.
         let bottomRule = makeRule()
@@ -331,11 +330,11 @@ public final class HomeWalletViewController: UIViewController, HomeScreenViewTyp
                     // per-wallet backup password.
                     self.beginRestoreFromFile()
                     case 3:
-                    // Restore from cloud folder. The folder picker is
+                    // Restore from a folder. The folder picker is
                     // re-presented every time so the user can switch
                     // folders (the previous "skip if bookmark exists" path
                     // could trap users on an empty folder forever).
-                    self.beginRestoreFromCloud()
+                    self.beginRestoreFromFolder()
                     default:
                     break
                 }
@@ -463,16 +462,16 @@ public final class HomeWalletViewController: UIViewController, HomeScreenViewTyp
         }
     }
 
-    /// Post-onboarding-safe entry into `startCloudRestore`. Resolves
+    /// Post-onboarding-safe entry into `startFolderRestore`. Resolves
     /// the strongbox-write password first, then delegates to the
     /// existing folder-picker + `runBatch` pipeline.
-    private func beginRestoreFromCloud() {
+    private func beginRestoreFromFolder() {
         resolveStrongboxWritePassword { [weak self] pw in
-            self?.startCloudRestore(strongboxPassword: pw)
+            self?.startFolderRestore(strongboxPassword: pw)
         }
     }
 
-    /// Restore-from-cloud entry. Always re-presents the folder picker
+    /// Restore-from-folder entry. Always re-presents the folder picker
     /// so the user can pick a different folder each time; if the
     /// chosen folder has no `.wallet` files, surfaces the localized
     /// "no backups found" toast and bails out (the picker will be
@@ -480,7 +479,7 @@ public final class HomeWalletViewController: UIViewController, HomeScreenViewTyp
     /// `strongboxPassword` is forwarded to `RestoreFlow.runBatch` so the
     /// keystore is bootstrapped with the user's chosen strongbox password
     /// on first run instead of the per-wallet backup password.
-    private func startCloudRestore(strongboxPassword: String? = nil) {
+    private func startFolderRestore(strongboxPassword: String? = nil) {
         CloudBackupManager.shared.presentFolderPicker(from: self) { [weak self] ok in
             guard let self = self, ok else { return }
             let files = CloudBackupManager.shared.listWalletFiles
@@ -785,8 +784,6 @@ public final class HomeWalletViewController: UIViewController, HomeScreenViewTyp
         let backBar = makeBackBar()
         let title = makeTitle(L.getBackupOptionsTitleByLangValues())
         let body = makeBody(L.getBackupOptionsDescriptionByLangValues())
-        let cloud = makePrimaryButton(L.getBackupToCloudByLangValues())
-        cloud.addTarget(self, action: #selector(tapBackupCloud), for: .touchUpInside)
         let file = makePrimaryButton(L.getBackupToFileByLangValues())
         file.addTarget(self, action: #selector(tapBackupFile), for: .touchUpInside)
 
@@ -809,7 +806,7 @@ public final class HomeWalletViewController: UIViewController, HomeScreenViewTyp
         nextRow.addArrangedSubview(spacer)
         nextRow.addArrangedSubview(next)
 
-        [backBar, title, body, makeRule(), cloud, file, makeRule(), nextRow]
+        [backBar, title, body, makeRule(), file, makeRule(), nextRow]
         .forEach { contentStack.addArrangedSubview($0) }
     }
 
@@ -1406,25 +1403,6 @@ public final class HomeWalletViewController: UIViewController, HomeScreenViewTyp
         present(dlg, animated: true)
     }
 
-    @objc private func tapBackupCloud() {
-        // Mirror Android `startCloudBackupFromOptionsScreen`:
-        // 1. show the cloud-backup info dialog,
-        // 2. prompt for a fresh backup password (`BackupPasswordDialog`),
-        // 3. re-encrypt the wallet with that password while showing
-        // `WaitDialog`,
-        // 4. write the encrypted JSON via the security-scoped folder
-        // picked through `UIDocumentPickerViewController(forOpening:
-        // [.folder])` - the iOS analog of Android's
-        // `Intent.ACTION_OPEN_DOCUMENT_TREE`.
-        let info = ConfirmDialogViewController(
-            title: "",
-            message: Localization.shared.getCloudBackupInfoByLangValues(),
-            confirmText: Localization.shared.getOkByLangValues(),
-            hideCancel: true)
-        info.onConfirm = { [weak self] in self?.promptBackupPassword(target: .cloud) }
-        present(info, animated: true)
-    }
-
     @objc private func tapBackupFile() {
         // Mirror Android `startFileBackupFromOptionsScreen`:
         // 1. prompt for a backup password,
@@ -1432,10 +1410,10 @@ public final class HomeWalletViewController: UIViewController, HomeScreenViewTyp
         // 3. save the encrypted JSON via
         // `UIDocumentPickerViewController(forExporting:)` - the iOS
         // analog of Android's `Intent.ACTION_CREATE_DOCUMENT`.
-        promptBackupPassword(target: .file)
+        promptBackupPassword()
     }
 
-    private func promptBackupPassword(target: BackupTarget) {
+    private func promptBackupPassword() {
         // Pass `generatedAddress` so the dialog's hidden `.username`
         // field can scope the iOS Keychain Save prompt to a per-
         // wallet slot (see `CredentialIdentifier.backupUsername(address:)`),
@@ -1445,13 +1423,13 @@ public final class HomeWalletViewController: UIViewController, HomeScreenViewTyp
         dlg.onSubmit = { [weak self, weak dlg] backupPwd in
             guard let self = self else { return }
             dlg?.dismiss(animated: true) { [weak self] in
-                self?.encryptAndExportBackup(target: target, password: backupPwd)
+                self?.encryptAndExportBackup(password: backupPwd)
             }
         }
         present(dlg, animated: true)
     }
 
-    private func encryptAndExportBackup(target: BackupTarget, password: String) {
+    private func encryptAndExportBackup(password: String) {
         // During fresh wallet creation `generatedSeed` is populated by
         // `generateSeedWords` / `persistPendingWallet` and survives
         // through to this point, so we can hand it directly to the
@@ -1465,7 +1443,6 @@ public final class HomeWalletViewController: UIViewController, HomeScreenViewTyp
             payload: .seedWords(generatedSeed),
             address: generatedAddress,
             backupPassword: password,
-            target: target,
             presenter: self)
     }
 
@@ -2022,9 +1999,9 @@ public final class HomeWalletViewController: UIViewController, HomeScreenViewTyp
         b.backgroundColor = UIColor(named: "colorPrimary") ?? .systemBlue
         // `colorCommon7` is white in light mode and black in dark mode.
         // Matches the convention already used by `GreenPillButton` /
-        // `GrayPillButton` so the onboarding `Next`, `Backup to Cloud`,
-        // and `Backup to File` titles flip to black in dark mode
-        // instead of staying hard-coded white against the purple pill.
+        // `GrayPillButton` so the onboarding `Next` and `Backup to File`
+        // titles flip to black in dark mode instead of staying
+        // hard-coded white against the purple pill.
         b.setTitleColor(UIColor(named: "colorCommon7") ?? .white, for: .normal)
         b.layer.cornerRadius = 10
         b.heightAnchor.constraint(equalToConstant: 44).isActive = true

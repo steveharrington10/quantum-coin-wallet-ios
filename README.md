@@ -171,15 +171,11 @@ signed transaction is reproducible across both clients.
 - **File backup** via `UIDocumentPickerViewController(forExporting:)`
   — wallet is re-encrypted under a user-supplied backup password
   (independent of the unlock password), then handed to the picker.
-- **Cloud-folder backup** — user picks a folder once
-  (typically iCloud Drive) and subsequent writes go to a
-  remembered security-scoped bookmark; an explicit
-  "submitted to iCloud, sync may take time" dialog runs after
-  iCloud writes so the user knows the file isn't yet on Apple's
-  servers (`Backup/CloudBackupManager.swift`).
-- **Restore from cloud folder** enumerates `.wallet` files in the
-  remembered folder and runs the same batched-decrypt loop the
-  file restore uses (`Backup/RestoreFlow.swift`).
+- **Restore from folder** enumerates `.wallet` files in a
+  user-picked folder (the picker reopens at the last-used folder via
+  a remembered security-scoped bookmark) and runs the same
+  batched-decrypt loop the file restore uses
+  (`Backup/RestoreFlow.swift`).
 - **Cross-platform backup compatibility.** Per-wallet exported
   `.wallet` files are produced by the shared
   `quantumcoin-bundle.js` `Wallet.encryptSync` call on both
