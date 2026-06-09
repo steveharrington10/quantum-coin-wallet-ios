@@ -75,6 +75,40 @@ if (_isDebug()) {
 }
 
 var _sdkInitialized = false;
+// Track the (chainId, rpcEndpoint) the SDK was last Initialized
+// with so the signing handlers can SKIP a redundant
+// `QuantumCoinSDK.Initialize(...)` when the config is unchanged.
+// Re-Initializing per send re-pays the Go-WASM module
+// compile + runtime bring-up cost on every transaction; guarding
+// it removes that cost from the timed signing path while still
+// re-initializing whenever the user switches network. `null`
+// means "last init was offline / unconfigured" so the next
+// configured call always re-initializes.
+var _sdkInitChainId = null;
+var _sdkInitRpc = null;
+
+// DEBUG-only per-phase timing for the send path. Emits an opaque
+// label plus millisecond deltas only (never any payload-derived
+// string) through the AndroidBridge.debugLog channel so the
+// durations reach the native log even when the overall bridge
+// call later times out - each phase logs the moment it completes,
+// so a 120s timeout still shows which phase was the long pole and
+// how far execution got. Gated by _isDebug() so release builds
+// emit nothing.
+function _now() {
+ return (typeof performance !== 'undefined' && performance.now)
+ ? performance.now() : Date.now();
+}
+function _timeLog(tag) {
+ if (!_isDebug()) return;
+ try {
+ if (typeof AndroidBridge !== 'undefined'
+ && typeof AndroidBridge.debugLog === 'function') {
+ AndroidBridge.debugLog('TIMING ' + tag);
+ }
+ console.log('TIMING ' + tag);
+ } catch (_) {}
+}
 
 function bytesToBase64(bytes) {
  var binary = '';
@@ -245,6 +279,10 @@ async function ensureInitialized(requestId) {
  if (!_sdkInitialized) {
  var result = await QuantumCoinSDK.Initialize(null);
  _sdkInitialized = true;
+ // Offline/unconfigured init: leave the config trackers null
+ // so a later configured signing call re-initializes.
+ _sdkInitChainId = null;
+ _sdkInitRpc = null;
  if (_isDebug()) {
  // Opaque status only; the SDK Initialize result
  // includes config-derived strings (RPC endpoint URL,
@@ -253,6 +291,46 @@ async function ensureInitialized(requestId) {
  }
  }
  return true;
+}
+
+// Initialize the SDK for (chainId, rpcEndpoint) only when the
+// current config differs from the last one. Avoids re-paying the
+// Go-WASM bring-up cost on every send. Returns nothing; throws on
+// SDK failure (caller is inside a try/catch).
+async function ensureConfigured(chainId, rpcEndpoint) {
+ if (!_sdkInitialized
+ || _sdkInitChainId !== chainId
+ || _sdkInitRpc !== rpcEndpoint) {
+ await QuantumCoinSDK.Initialize(
+ new QuantumCoinSDK.Config(chainId, rpcEndpoint));
+ _sdkInitialized = true;
+ _sdkInitChainId = chainId;
+ _sdkInitRpc = rpcEndpoint;
+ }
+}
+
+// Launch-time warm-up (fired fire-and-forget by the native side as
+// soon as the bridge becomes ready). Pays the one-time Go-WASM
+// compile + runtime + PQC-keygen cost OFF the critical path, so the
+// user's first transaction does not absorb module bring-up on top
+// of signing. Network-free (offline Initialize) and the throwaway
+// wallet is never persisted or returned. Best-effort: any failure
+// is swallowed so a warm-up problem never blocks the bridge.
+async function _warmup() {
+ try {
+ if (typeof QuantumCoinSDK === 'undefined') return;
+ var _w0 = _now();
+ await QuantumCoinSDK.Initialize(null);
+ _sdkInitialized = true;
+ _sdkInitChainId = null;
+ _sdkInitRpc = null;
+ // Exercise the circl PQC WASM once so the module is
+ // compiled/instantiated and the Go runtime is started before
+ // the first real send. Keygen is the cheapest call that still
+ // forces full WASM bring-up.
+ try { QuantumCoinSDK.Wallet.createRandom(); } catch (_) {}
+ _timeLog('warmup=' + Math.round(_now() - _w0) + 'ms');
+ } catch (_) {}
 }
 
 // Sensitive payloads (passwords, private keys, seed words) are never
@@ -318,6 +396,8 @@ var bridge = {
  if (!requireSDK(requestId)) return;
  await QuantumCoinSDK.Initialize(new QuantumCoinSDK.Config(chainId, rpcEndpoint));
  _sdkInitialized = true;
+ _sdkInitChainId = chainId;
+ _sdkInitRpc = rpcEndpoint;
  sendResult(requestId, {});
  } catch (e) {
  sendError(requestId, e);
@@ -485,24 +565,31 @@ var bridge = {
  var privBytes = null;
  var pubBytes = null;
  try {
+ var _t0 = _now();
  if (!requireSDK(requestId)) return;
  payload = pullPayload(requestId);
  if (!payload) return;
- await QuantumCoinSDK.Initialize(
- new QuantumCoinSDK.Config(payload.chainId, payload.rpcEndpoint));
- _sdkInitialized = true;
+ await ensureConfigured(payload.chainId, payload.rpcEndpoint);
+ _timeLog('send.init=' + Math.round(_now() - _t0) + 'ms req=' + requestId);
+ var _t1 = _now();
  var provider = new QuantumCoinSDK.JsonRpcProvider(
  payload.rpcEndpoint, payload.chainId);
  privBytes = pullPayloadBinary(requestId, 'privKey');
  pubBytes = pullPayloadBinary(requestId, 'pubKey');
  var wallet = await QuantumCoinSDK.Wallet.fromKeys(privBytes, pubBytes, provider);
+ _timeLog('send.fromKeys=' + Math.round(_now() - _t1) + 'ms');
+ var _t2 = _now();
  var signingContext = wallet.getSigningContext(payload.advancedSigning === true);
+ _timeLog('send.getSigningContext=' + Math.round(_now() - _t2) + 'ms');
+ var _t3 = _now();
  var tx = await wallet.sendTransaction({
  to: payload.to,
  value: BigInt(payload.value),
  gasLimit: Number(payload.gasLimit),
  signingContext: signingContext
  });
+ _timeLog('send.sendTransaction(populate+sign+broadcast)='
+ + Math.round(_now() - _t3) + 'ms total=' + Math.round(_now() - _t0) + 'ms');
  sendResult(requestId, { txHash: tx.hash });
  } catch (e) {
  sendError(requestId, e);
@@ -536,6 +623,7 @@ var bridge = {
  var privBytes = null;
  var pubBytes = null;
  try {
+ var _t0 = _now();
  if (!requireSDK(requestId)) return;
  if (!QuantumCoinSDK.IERC20) {
  sendError(requestId, new Error(
@@ -544,20 +632,26 @@ var bridge = {
  }
  payload = pullPayload(requestId);
  if (!payload) return;
- await QuantumCoinSDK.Initialize(
- new QuantumCoinSDK.Config(payload.chainId, payload.rpcEndpoint));
- _sdkInitialized = true;
+ await ensureConfigured(payload.chainId, payload.rpcEndpoint);
+ _timeLog('token.init=' + Math.round(_now() - _t0) + 'ms req=' + requestId);
+ var _t1 = _now();
  var provider = new QuantumCoinSDK.JsonRpcProvider(
  payload.rpcEndpoint, payload.chainId);
  privBytes = pullPayloadBinary(requestId, 'privKey');
  pubBytes = pullPayloadBinary(requestId, 'pubKey');
  var wallet = await QuantumCoinSDK.Wallet.fromKeys(privBytes, pubBytes, provider);
+ _timeLog('token.fromKeys=' + Math.round(_now() - _t1) + 'ms');
+ var _t2 = _now();
  var signingContext = wallet.getSigningContext(payload.advancedSigning === true);
+ _timeLog('token.getSigningContext=' + Math.round(_now() - _t2) + 'ms');
+ var _t3 = _now();
  var token = QuantumCoinSDK.IERC20.connect(payload.contract, wallet);
  var tx = await token.transfer(payload.to, BigInt(payload.amount), {
  gasLimit: Number(payload.gasLimit),
  signingContext: signingContext
  });
+ _timeLog('token.transfer(populate+sign+broadcast)='
+ + Math.round(_now() - _t3) + 'ms total=' + Math.round(_now() - _t0) + 'ms');
  sendResult(requestId, { txHash: tx.hash });
  } catch (e) {
  sendError(requestId, e);

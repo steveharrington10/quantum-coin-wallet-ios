@@ -179,7 +179,9 @@ public final class JsBridge: @unchecked Sendable {
         // launch. See `Security/TamperGatePolicy.swift` for the
         // full policy and tradeoff write-up.
         try TamperGatePolicy.shared.assertSafeToSign()
-        return try blockingCall(settleTimeout: Self.signingTimeoutSeconds) { cb, rid in
+        Self.debugProbeRpcLatency(endpoint: rpcEndpoint, chainId: chainId)
+        return try blockingCall(settleTimeout: Self.signingTimeoutSeconds,
+            label: "sendTransaction") { cb, rid in
             // Stage the secret bytes on the binary channel
             // (NOT in the JSON payload). The JSON envelope carries
             // only the non-secret signing context.
@@ -213,7 +215,9 @@ public final class JsBridge: @unchecked Sendable {
         // ERC-20-style token path because the same private key
         // signs both transaction kinds.
         try TamperGatePolicy.shared.assertSafeToSign()
-        return try blockingCall(settleTimeout: Self.signingTimeoutSeconds) { cb, rid in
+        Self.debugProbeRpcLatency(endpoint: rpcEndpoint, chainId: chainId)
+        return try blockingCall(settleTimeout: Self.signingTimeoutSeconds,
+            label: "sendTokenTransaction") { cb, rid in
             try JsEngine.shared.storePendingPayloadBinary(
                 requestId: rid, key: "privKey", data: privKey)
             try JsEngine.shared.storePendingPayloadBinary(
@@ -498,10 +502,11 @@ public final class JsBridge: @unchecked Sendable {
     // MARK: - Internals
 
     private func blockingCall(settleTimeout: TimeInterval = defaultTimeoutSeconds,
+        label: String = "",
         _ body: (BridgeCallback, String) throws -> Void) throws -> String {
         let requestId = UUID().uuidString.lowercased()
         return try blockingCallWithExplicitRid(requestId: requestId,
-            settleTimeout: settleTimeout) { cb in
+            settleTimeout: settleTimeout, label: label) { cb in
             try body(cb, requestId)
         }
     }
@@ -512,8 +517,16 @@ public final class JsBridge: @unchecked Sendable {
     /// the same rid the JS handler will stage them under.
     /// `settleTimeout` controls only the result wait; the bridge-
     /// readiness wait always uses `defaultTimeoutSeconds`.
+    /// `label` is a DEBUG-only diagnostic tag (e.g. `"sendTransaction"`)
+    /// used to log how long the native side waited before the result
+    /// settled or the `settleTimeout` fired. Empty by default so the
+    /// non-signing call sites stay silent. The logged value is just a
+    /// handler name plus an elapsed-seconds number, so it carries no
+    /// payload-derived data; `Logger.debug` is additionally a no-op in
+    /// Release.
     private func blockingCallWithExplicitRid(requestId: String,
         settleTimeout: TimeInterval = defaultTimeoutSeconds,
+        label: String = "",
         body: (BridgeCallback) throws -> Void) throws -> String {
         precondition(!Thread.isMainThread,
             "Blocking bridge call must not be invoked on the main thread")
@@ -529,9 +542,22 @@ public final class JsBridge: @unchecked Sendable {
             JsEngine.shared.removePendingPayload(requestId: requestId)
             throw error
         }
+        let started = Date()
         guard let outcome = settle.waitUntilSettled(timeout: settleTimeout) else {
             JsEngine.shared.removePendingPayload(requestId: requestId)
+            if !label.isEmpty {
+                let elapsed = Date().timeIntervalSince(started)
+                Logger.debug(category: "BRIDGE_TIMING",
+                    "\(label) TIMED OUT after "
+                    + String(format: "%.1f", elapsed)
+                    + "s (budget \(String(format: "%.0f", settleTimeout))s)")
+            }
             throw JsEngineError.timeout
+        }
+        if !label.isEmpty {
+            let elapsed = Date().timeIntervalSince(started)
+            Logger.debug(category: "BRIDGE_TIMING",
+                "\(label) settled in " + String(format: "%.1f", elapsed) + "s")
         }
         switch outcome {
             case .success(let json):
@@ -540,6 +566,48 @@ public final class JsBridge: @unchecked Sendable {
             JsEngine.shared.removePendingPayload(requestId: requestId)
             throw JsEngineError.callFailed(message)
         }
+    }
+
+    /// DEBUG-only diagnostic: measure how long a single `eth_chainId`
+    /// JSON-RPC round-trip to the configured node takes FROM THE
+    /// DEVICE, independent of the WebView/WASM path. This isolates
+    /// "is the RPC endpoint slow/unreachable from this device" from
+    /// "is the on-device PQC signing slow". Fired fire-and-forget on a
+    /// background queue so it never adds latency to the signing call,
+    /// and compiled out entirely in Release (`Logger.debug` is a
+    /// no-op and the whole body is `#if DEBUG`). The probe sends no
+    /// secret material - only the standard `eth_chainId` request.
+    private static func debugProbeRpcLatency(endpoint: String, chainId: Int) {
+        #if DEBUG
+        guard let url = URL(string: endpoint) else { return }
+        DispatchQueue.global(qos: .utility).async {
+            var req = URLRequest(url: url)
+            req.httpMethod = "POST"
+            req.timeoutInterval = 30
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.httpBody = Data(
+                "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_chainId\",\"params\":[]}"
+                    .utf8)
+            let started = Date()
+            let sem = DispatchSemaphore(value: 0)
+            let task = URLSession.shared.dataTask(with: req) { _, response, error in
+                let elapsed = Date().timeIntervalSince(started)
+                if let error = error {
+                    Logger.debug(category: "BRIDGE_TIMING",
+                        "rpcProbe(eth_chainId) failed after "
+                        + String(format: "%.1f", elapsed) + "s: \(error)")
+                } else {
+                    let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+                    Logger.debug(category: "BRIDGE_TIMING",
+                        "rpcProbe(eth_chainId) http=\(code) in "
+                        + String(format: "%.2f", elapsed) + "s")
+                }
+                sem.signal()
+            }
+            task.resume()
+            _ = sem.wait(timeout: .now() + 31)
+        }
+        #endif
     }
 
     /// Minimal JSON serializer that keeps key order stable (the Android
