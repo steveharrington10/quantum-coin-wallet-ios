@@ -204,7 +204,7 @@ public enum TlsPinning {
     // build that ships to users.
     // -----------------------------------------------------------
 
-    public static let kTlsPinningEnforced: Bool = true
+    public static let kTlsPinningEnforced: Bool = false
     public static let kPinFailureLogOnly: Bool = false
 
     // -----------------------------------------------------------

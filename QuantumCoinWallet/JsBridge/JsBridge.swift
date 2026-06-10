@@ -181,7 +181,7 @@ public final class JsBridge: @unchecked Sendable {
         try TamperGatePolicy.shared.assertSafeToSign()
         Self.debugProbeRpcLatency(endpoint: rpcEndpoint, chainId: chainId)
         return try blockingCall(settleTimeout: Self.signingTimeoutSeconds,
-            label: "sendTransaction") { cb, rid in
+            label: "sendTransaction", rpcEndpoint: rpcEndpoint) { cb, rid in
             // Stage the secret bytes on the binary channel
             // (NOT in the JSON payload). The JSON envelope carries
             // only the non-secret signing context.
@@ -217,7 +217,7 @@ public final class JsBridge: @unchecked Sendable {
         try TamperGatePolicy.shared.assertSafeToSign()
         Self.debugProbeRpcLatency(endpoint: rpcEndpoint, chainId: chainId)
         return try blockingCall(settleTimeout: Self.signingTimeoutSeconds,
-            label: "sendTokenTransaction") { cb, rid in
+            label: "sendTokenTransaction", rpcEndpoint: rpcEndpoint) { cb, rid in
             try JsEngine.shared.storePendingPayloadBinary(
                 requestId: rid, key: "privKey", data: privKey)
             try JsEngine.shared.storePendingPayloadBinary(
@@ -503,10 +503,12 @@ public final class JsBridge: @unchecked Sendable {
 
     private func blockingCall(settleTimeout: TimeInterval = defaultTimeoutSeconds,
         label: String = "",
+        rpcEndpoint: String? = nil,
         _ body: (BridgeCallback, String) throws -> Void) throws -> String {
         let requestId = UUID().uuidString.lowercased()
         return try blockingCallWithExplicitRid(requestId: requestId,
-            settleTimeout: settleTimeout, label: label) { cb in
+            settleTimeout: settleTimeout, label: label,
+            rpcEndpoint: rpcEndpoint) { cb in
             try body(cb, requestId)
         }
     }
@@ -517,16 +519,25 @@ public final class JsBridge: @unchecked Sendable {
     /// the same rid the JS handler will stage them under.
     /// `settleTimeout` controls only the result wait; the bridge-
     /// readiness wait always uses `defaultTimeoutSeconds`.
-    /// `label` is a DEBUG-only diagnostic tag (e.g. `"sendTransaction"`)
-    /// used to log how long the native side waited before the result
-    /// settled or the `settleTimeout` fired. Empty by default so the
-    /// non-signing call sites stay silent. The logged value is just a
-    /// handler name plus an elapsed-seconds number, so it carries no
-    /// payload-derived data; `Logger.debug` is additionally a no-op in
-    /// Release.
+    /// `label` is a diagnostic tag (e.g. `"sendTransaction"`) used in
+    /// the timing log AND, on timeout, in the user-facing error so the
+    /// alert names the handler that stalled. Empty by default so the
+    /// non-signing call sites stay generic. The value is just a handler
+    /// name plus an elapsed-seconds number, so it carries no payload-
+    /// derived data.
+    /// `rpcEndpoint`, when supplied (the signing call sites pass it),
+    /// turns the timeout path self-diagnosing: on a stall we run a
+    /// bounded reachability probe against that endpoint and append the
+    /// result to the thrown error. This distinguishes "RPC endpoint
+    /// unreachable from this device/network" (the dominant
+    /// works-in-simulator-hangs-on-device cause) from "endpoint
+    /// reachable but the signing/broadcast itself stalled", surfaced
+    /// directly in the user's alert without needing `Logger.debug`
+    /// (a no-op in Release).
     private func blockingCallWithExplicitRid(requestId: String,
         settleTimeout: TimeInterval = defaultTimeoutSeconds,
         label: String = "",
+        rpcEndpoint: String? = nil,
         body: (BridgeCallback) throws -> Void) throws -> String {
         precondition(!Thread.isMainThread,
             "Blocking bridge call must not be invoked on the main thread")
@@ -552,9 +563,16 @@ public final class JsBridge: @unchecked Sendable {
             // output (which is a no-op in Release).
             let elapsed = Date().timeIntervalSince(started)
             let tag = label.isEmpty ? "bridge call" : label
-            let diagnostic = "\(tag) did not respond within "
+            var diagnostic = "\(tag) did not respond within "
                 + String(format: "%.0f", settleTimeout) + "s "
                 + "(waited " + String(format: "%.1f", elapsed) + "s)"
+            // A signing stall is almost always the RPC round-trips
+            // inside the send (populate nonce/gas, then broadcast),
+            // not the local signing. Probe the endpoint so the alert
+            // says whether the device could reach it at all.
+            if let endpoint = rpcEndpoint, !endpoint.isEmpty {
+                diagnostic += ". " + Self.probeRpcReachability(endpoint: endpoint)
+            }
             Logger.debug(category: "BRIDGE_TIMING", "TIMED OUT: \(diagnostic)")
             throw JsEngineError.timeout(diagnostic)
         }
@@ -612,6 +630,61 @@ public final class JsBridge: @unchecked Sendable {
             _ = sem.wait(timeout: .now() + 31)
         }
         #endif
+    }
+
+    /// Bounded JSON-RPC reachability check, run ONLY on the signing
+    /// timeout path (never on the happy path), to tell the user — in
+    /// the alert itself — whether the device could reach the configured
+    /// RPC endpoint. This separates "endpoint unreachable from this
+    /// device/network" (works in simulator, hangs on device) from
+    /// "endpoint reachable but the broadcast/signing stalled". Sends
+    /// only the standard `eth_chainId` request, so no secret material
+    /// leaves the device. The returned string is host-only (never the
+    /// full URL, which may carry an API key in its path) and safe to
+    /// show in a user-facing alert. Bounded by `timeout`, so it adds at
+    /// most a few seconds to an error path that has already waited the
+    /// full signing budget. NOTE: this uses the native URLSession
+    /// stack, not the WebView's; a "reachable" result here with a
+    /// WebView stall points at a WebView-level issue (CORS/ATS),
+    /// whereas "unreachable" points at device network / endpoint.
+    private static func probeRpcReachability(endpoint: String,
+        timeout: TimeInterval = 12) -> String {
+        let host = URL(string: endpoint)?.host ?? endpoint
+        guard let url = URL(string: endpoint) else {
+            return "RPC endpoint \(host): invalid URL"
+        }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.timeoutInterval = timeout
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = Data(
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_chainId\",\"params\":[]}"
+                .utf8)
+        let started = Date()
+        let sem = DispatchSemaphore(value: 0)
+        var status = "RPC endpoint \(host): status unknown"
+        let task = URLSession.shared.dataTask(with: req) { _, response, error in
+            let elapsed = Date().timeIntervalSince(started)
+            if let error = error {
+                let ns = error as NSError
+                status = "RPC endpoint \(host): unreachable "
+                    + "(\(ns.domain)#\(ns.code) after "
+                    + String(format: "%.1f", elapsed) + "s)"
+            } else {
+                let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+                status = "RPC endpoint \(host): reachable "
+                    + "(HTTP \(code) in "
+                    + String(format: "%.1f", elapsed) + "s)"
+            }
+            sem.signal()
+        }
+        task.resume()
+        if sem.wait(timeout: .now() + timeout + 1) == .timedOut {
+            task.cancel()
+            status = "RPC endpoint \(host): unreachable (probe timed out after "
+                + String(format: "%.0f", timeout) + "s)"
+        }
+        return status
     }
 
     /// Minimal JSON serializer that keeps key order stable (the Android
